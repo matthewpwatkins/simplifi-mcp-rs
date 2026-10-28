@@ -1119,10 +1119,7 @@ impl SimplifiMcpServer {
     #[tool(
         description = "Split a transaction across two or more categories. Line amounts \
                        (decimal strings, signed like the transaction) must total the \
-                       transaction amount exactly. Requires SIMPLIFI_MCP_ALLOW_WRITES=1; \
-                       a FRESH split (transaction not already split) additionally requires \
-                       SIMPLIFI_ENABLE_UNVERIFIED_WRITES=1 because the split container \
-                       shape is inferred, not HAR-verified."
+                       transaction amount exactly. Requires SIMPLIFI_MCP_ALLOW_WRITES=1."
     )]
     pub async fn split_transaction(
         &self,

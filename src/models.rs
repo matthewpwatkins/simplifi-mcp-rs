@@ -148,14 +148,21 @@ pub struct Transaction {
     pub extra: Extra,
 }
 
-/// Required fields for `PUT /transactions/{id}` (openapi.yaml:679-694 + spec section 4.2).
-pub const UPSERT_REQUIRED_FIELDS: [&str; 11] = [
+/// Fields required for `PUT /transactions/{id}`. The HAR-derived spec list
+/// (openapi.yaml:679-694 + spec section 4.2) names 11, including `clientId`
+/// and `coa` — but live data contradicts both (verified 2026-10-27 against a
+/// real account, 1,507 transactions from 2026): downloaded transactions
+/// almost never carry `clientId` (present on 5 of 1,507), and split
+/// transactions never carry a parent `coa` (their categories live in the
+/// split lines; absent on exactly the 86 split transactions). Requiring
+/// either makes every update of a real downloaded transaction fail
+/// validation, so the enforced set is the 9 fields that are in fact
+/// universal. `NewTransaction` creation still sends a clientId.
+pub const UPSERT_REQUIRED_FIELDS: [&str; 9] = [
     "id",
-    "clientId",
     "accountId",
     "postedOn",
     "payee",
-    "coa",
     "amount",
     "state",
     "matchState",
@@ -164,8 +171,8 @@ pub const UPSERT_REQUIRED_FIELDS: [&str; 11] = [
 ];
 
 impl Transaction {
-    /// Validate the full upsert-required field set (stricter than upstream's runtime
-    /// check, which omits clientId; the HAR spec requires it).
+    /// Validate the upsert-required field set (see [`UPSERT_REQUIRED_FIELDS`]
+    /// for why `clientId`/`coa` are not enforced).
     pub fn validate_upsert_required(&self) -> Result<(), Vec<&'static str>> {
         fn empty(v: &Option<String>) -> bool {
             v.as_deref().map(|s| s.is_empty()).unwrap_or(true)
@@ -173,9 +180,6 @@ impl Transaction {
         let mut missing = Vec::new();
         if self.id.is_empty() {
             missing.push("id");
-        }
-        if empty(&self.client_id) {
-            missing.push("clientId");
         }
         if empty(&self.account_id) {
             missing.push("accountId");
@@ -185,10 +189,6 @@ impl Transaction {
         }
         if self.payee.is_none() {
             missing.push("payee");
-        }
-        match &self.coa {
-            Some(c) if !empty(&c.coa_type) && !empty(&c.id) => {}
-            _ => missing.push("coa"),
         }
         if self.amount.is_none() {
             missing.push("amount");
@@ -256,6 +256,11 @@ impl Transaction {
     /// position, rate (= amount), type and flag fields, which the client
     /// fills in (see `SimplifiClient::split_transaction`).
     pub fn apply_split(&mut self, lines: &[SplitLine]) {
+        // A split transaction carries no parent category: live data shows
+        // every split transaction (86/86 observed) has no `coa` — categories
+        // live only in the lines — and a fresh-split PUT that kept the
+        // parent coa was rejected by the API (2026-10-27).
+        self.coa = None;
         let lines_json: Vec<serde_json::Value> = lines
             .iter()
             .map(|l| serde_json::to_value(l).unwrap_or_default())
@@ -806,13 +811,26 @@ mod tests {
         let t: Transaction = serde_json::from_value(serde_json::json!({ "id": "txn-1" })).unwrap();
         let missing = t.validate_upsert_required().unwrap_err();
         for f in [
-            "clientId", "accountId", "postedOn", "payee", "coa", "amount", "state",
-            "matchState", "source", "type",
+            "accountId", "postedOn", "payee", "amount", "state", "matchState", "source",
+            "type",
         ] {
             assert!(missing.contains(&f), "expected {f} in {missing:?}");
         }
+        // clientId and coa are NOT required: live downloaded transactions
+        // lack clientId, and split transactions lack a parent coa.
+        assert!(!missing.contains(&"clientId"));
+        assert!(!missing.contains(&"coa"));
         let full: Transaction = serde_json::from_value(sample_txn_json()).unwrap();
         assert!(full.validate_upsert_required().is_ok());
+        // A split-shaped transaction (no coa, no clientId) validates.
+        let split: Transaction = serde_json::from_value(serde_json::json!({
+            "id": "txn-s", "accountId": "acc-1", "postedOn": "2026-10-15",
+            "payee": "Costco Whse", "amount": -51.60, "state": "CLEARED",
+            "matchState": "NOT_MATCHED", "source": "QCS_REFRESH", "type": "CASH_FLOW",
+            "split": { "items": [] }
+        }))
+        .unwrap();
+        assert!(split.validate_upsert_required().is_ok());
     }
 
     #[test]

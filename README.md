@@ -145,7 +145,7 @@ outputs are `{total, nextCursor?, items}`.
 | `list_datasets` | Datasets visible to the logged-in user |
 | `export_transactions` | `json`, `csv` (import-template), or `csv_full` (archival); oldest-first, 10k cap, formula-injection-sanitized |
 | `recurring_detection` | Normalized-payee cadence detection (weekly → annual) with next-expected dates |
-| `split_transaction` | Split a transaction across ≥ 2 categories; line amounts must total the transaction amount exactly (decimal-checked) — **write-gated**; a *fresh* split additionally requires the unverified-writes gate (inferred container shape), re-splits preserve the observed shape. Setting a category directly on a split transaction clears its split, mirroring the web app |
+| `split_transaction` | Split a transaction across ≥ 2 categories; line amounts must total the transaction amount exactly (decimal-checked) — **write-gated**. Wire shape observed from live transactions and verified end-to-end (fresh-split and re-split PUTs, 2026-10-27): `split = {"items": [...]}`, no parent `coa`; re-splits preserve line ids. Setting a category directly on a split transaction clears its split, mirroring the web app |
 | `bulk_update_transactions` | Apply one typed patch to every transaction matching the read-lane filters (+ optional text query); `confirm:false` previews matches, `confirm:true` applies sequentially — **write-gated** |
 
 ### Write gating (defense in depth)

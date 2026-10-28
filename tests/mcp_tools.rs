@@ -518,7 +518,7 @@ async fn split_transaction_roundtrip_and_gates() {
     assert!(is_error(&r));
     assert_eq!(payload(&r)["error"], "writes_disabled");
 
-    // writes on, unverified off: a FRESH split stays gated (inferred shape)
+    // writes on (unverified off): splits are live-verified, so no extra gate
     let s = server_with(dir.path(), true, false).await;
     let r = s
         .split_transaction(Parameters(SplitTransactionInput {
@@ -527,8 +527,7 @@ async fn split_transaction_roundtrip_and_gates() {
         }))
         .await
         .unwrap();
-    assert!(is_error(&r));
-    assert_eq!(payload(&r)["error"], "unverified_endpoint_disabled");
+    assert!(!is_error(&r), "{:?}", payload(&r));
 
     // fully enabled
     let s = write_server(dir.path()).await;
