@@ -262,10 +262,16 @@ impl SimplifiClient {
     /// [`crate::models::validate_split`]), set the `split` object on a clone of
     /// `base`, and PUT it like any other update.
     ///
-    /// Re-splitting an already-split transaction preserves the split object's
-    /// observed container shape. A FRESH split uses the inferred
-    /// `{ "splits": [...] }` container, so it additionally requires
-    /// `SIMPLIFI_ENABLE_UNVERIFIED_WRITES=1` until that shape is HAR-verified.
+    /// The wire shape was observed from live split transactions (2026-10-27):
+    /// `split = { "items": [ { amount, clientId, coa, id?, memo, position,
+    /// rate, type: "NORMAL", is* flags } ] }`. Lines are normalized before
+    /// the PUT: a re-split inherits the existing line at the same position
+    /// (keeping its server `id`/`clientId` stable, as the web app does);
+    /// fresh lines get a generated clientId and the web app's defaults.
+    /// `rate` always mirrors `amount`; `position` is the line index.
+    ///
+    /// A FRESH split additionally requires `SIMPLIFI_ENABLE_UNVERIFIED_WRITES=1`
+    /// until a fresh-split PUT has been observed to succeed end-to-end.
     pub async fn split_transaction(
         &self,
         base: &Transaction,
@@ -274,11 +280,75 @@ impl SimplifiClient {
         crate::models::validate_split(base, lines).map_err(Error::InvalidArgument)?;
         if base.split_raw().is_none() && !self.cfg.enable_unverified_writes {
             return Err(Error::UnverifiedEndpointDisabled(
-                "PUT /transactions/{id} fresh split object (inferred container shape)",
+                "PUT /transactions/{id} fresh split (shape observed on reads; \
+                 fresh-split PUT not yet verified)",
             ));
         }
+        let existing = base.split_lines().unwrap_or_default();
+        let wire: Vec<crate::models::SplitLine> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut w = existing.get(i).cloned().unwrap_or_else(|| {
+                    crate::models::SplitLine {
+                        coa: None,
+                        amount: None,
+                        memo: None,
+                        extra: crate::models::Extra::new(),
+                    }
+                });
+                w.coa = l.coa.clone();
+                w.amount = l.amount;
+                if l.memo.is_some() {
+                    w.memo = l.memo.clone();
+                }
+                if w.memo.is_none() {
+                    w.memo = Some(String::new());
+                }
+                if !w.extra.contains_key("clientId") {
+                    w.extra.insert(
+                        "clientId".to_string(),
+                        serde_json::Value::String(
+                            uuid::Uuid::new_v4().to_string().to_uppercase(),
+                        ),
+                    );
+                }
+                for flag in [
+                    "isBillable",
+                    "isExcludedFromF2S",
+                    "isExcludedFromReports",
+                    "isOverflow",
+                    "isRatePercentage",
+                    "isTaxable",
+                ] {
+                    if !w.extra.contains_key(flag) {
+                        w.extra
+                            .insert(flag.to_string(), serde_json::Value::Bool(false));
+                    }
+                }
+                if !w.extra.contains_key("type") {
+                    w.extra.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("NORMAL".to_string()),
+                    );
+                }
+                w.extra.insert(
+                    "position".to_string(),
+                    serde_json::Value::Number(i.into()),
+                );
+                if let Some(a) = l.amount {
+                    use rust_decimal::prelude::ToPrimitive;
+                    if let Some(f) = a.to_f64() {
+                        if let Some(n) = serde_json::Number::from_f64(f) {
+                            w.extra.insert("rate".to_string(), serde_json::Value::Number(n));
+                        }
+                    }
+                }
+                w
+            })
+            .collect();
         let mut updated = base.clone();
-        updated.apply_split(lines);
+        updated.apply_split(&wire);
         let ack = self.update_transaction(&updated).await?;
         Ok((updated, ack))
     }

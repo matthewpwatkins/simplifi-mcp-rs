@@ -250,9 +250,11 @@ impl Transaction {
     }
 
     /// Replace this transaction's split with `lines`, preserving the container
-    /// shape (object keys) of an existing split object. A fresh split uses
-    /// `{ "splits": [...] }` — that container shape is inferred, which is why
-    /// the client gates fresh splits behind the unverified-writes flag.
+    /// shape (object keys) of an existing split object. The fresh-split
+    /// container is `{ "items": [...] }` — observed from live split
+    /// transactions (2026-10-27); each line additionally carries a clientId,
+    /// position, rate (= amount), type and flag fields, which the client
+    /// fills in (see `SimplifiClient::split_transaction`).
     pub fn apply_split(&mut self, lines: &[SplitLine]) {
         let lines_json: Vec<serde_json::Value> = lines
             .iter()
@@ -263,7 +265,7 @@ impl Transaction {
             None => serde_json::Map::new(),
         };
         let key = Self::split_container_key(&serde_json::Value::Object(obj.clone()))
-            .unwrap_or_else(|| "splits".to_string());
+            .unwrap_or_else(|| "items".to_string());
         obj.insert(key, serde_json::Value::Array(lines_json));
         self.extra
             .insert("split".to_string(), serde_json::Value::Object(obj));
@@ -930,7 +932,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].coa.as_ref().unwrap().id.as_deref(), Some("cat-other"));
 
-        // A fresh split uses the inferred container.
+        // A fresh split uses the live-observed container key.
         let mut plain: Transaction =
             serde_json::from_value(serde_json::json!({ "id": "x", "amount": -10 })).unwrap();
         plain.apply_split(&[SplitLine::new(
@@ -938,7 +940,43 @@ mod tests {
             Decimal::from_str("-10").unwrap(),
             None,
         )]);
-        assert!(plain.split_raw().unwrap().get("splits").is_some());
+        assert!(plain.split_raw().unwrap().get("items").is_some());
+    }
+
+    #[test]
+    fn split_lines_parse_live_shape() {
+        // Sanitized copy of a real split object observed via inspect-split
+        // against a live account (2026-10-27): container "items", lines with
+        // clientId/id/position/rate/type/flags riding in extra.
+        let t: Transaction = serde_json::from_value(serde_json::json!({
+            "id": "txn-live",
+            "amount": -51.60,
+            "split": {
+                "items": [
+                    { "amount": -10.0, "clientId": "2E2CAF71-F909-4745-B385-AD2C68FF4D6B",
+                      "coa": { "id": "cat-a", "type": "CATEGORY" }, "id": "111",
+                      "isBillable": false, "isExcludedFromF2S": false,
+                      "isExcludedFromReports": false, "isOverflow": false,
+                      "isRatePercentage": false, "isTaxable": false, "memo": "",
+                      "position": 0, "rate": -10.0, "type": "NORMAL" },
+                    { "amount": -41.6, "clientId": "58541B80-540B-4100-A425-9182B5AF6069",
+                      "coa": { "id": "cat-b", "type": "CATEGORY" }, "id": "112",
+                      "isBillable": false, "isExcludedFromF2S": false,
+                      "isExcludedFromReports": false, "isOverflow": false,
+                      "isRatePercentage": false, "isTaxable": false, "memo": "",
+                      "position": 1, "rate": -41.6, "type": "NORMAL" }
+                ]
+            }
+        }))
+        .unwrap();
+        let lines = t.split_lines().expect("lines");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].coa.as_ref().unwrap().id.as_deref(), Some("cat-a"));
+        assert_eq!(lines[1].amount.unwrap(), Decimal::from_str("-41.6").unwrap());
+        // Server line identity survives the round trip via extra (re-split stability).
+        assert_eq!(lines[0].extra["id"], serde_json::json!("111"));
+        assert_eq!(lines[1].extra["position"], serde_json::json!(1));
+        assert!(validate_split(&t, &lines).is_ok());
     }
 
     #[test]
