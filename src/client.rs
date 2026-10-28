@@ -53,6 +53,13 @@ pub struct BulkCreateOutcome {
     pub aborted: bool,
 }
 
+/// Outcome of a bulk patch: per-item updated transactions (or errors) in input
+/// order; `aborted` set when the consecutive-failure threshold stopped the run.
+pub struct BulkPatchOutcome {
+    pub results: Vec<Result<(Transaction, UpsertAck)>>,
+    pub aborted: bool,
+}
+
 pub struct SimplifiClient {
     cfg: Arc<Config>,
     transport: Arc<Transport>,
@@ -249,6 +256,61 @@ impl SimplifiClient {
             ..Default::default()
         };
         self.patch_transaction(base, &patch).await
+    }
+
+    /// Split a transaction across categories: validate the lines (see
+    /// [`crate::models::validate_split`]), set the `split` object on a clone of
+    /// `base`, and PUT it like any other update.
+    ///
+    /// Re-splitting an already-split transaction preserves the split object's
+    /// observed container shape. A FRESH split uses the inferred
+    /// `{ "splits": [...] }` container, so it additionally requires
+    /// `SIMPLIFI_ENABLE_UNVERIFIED_WRITES=1` until that shape is HAR-verified.
+    pub async fn split_transaction(
+        &self,
+        base: &Transaction,
+        lines: &[crate::models::SplitLine],
+    ) -> Result<(Transaction, UpsertAck)> {
+        crate::models::validate_split(base, lines).map_err(Error::InvalidArgument)?;
+        if base.split_raw().is_none() && !self.cfg.enable_unverified_writes {
+            return Err(Error::UnverifiedEndpointDisabled(
+                "PUT /transactions/{id} fresh split object (inferred container shape)",
+            ));
+        }
+        let mut updated = base.clone();
+        updated.apply_split(lines);
+        let ack = self.update_transaction(&updated).await?;
+        Ok((updated, ack))
+    }
+
+    /// Apply the same typed patch to many transactions, sequentially (paced by
+    /// the global request floor), aborting after `BULK_ABORT_AFTER` consecutive
+    /// failures so a systemic rejection can't turn into a hammer.
+    pub async fn patch_transactions_bulk(
+        &self,
+        bases: &[Transaction],
+        patch: &TransactionPatch,
+    ) -> BulkPatchOutcome {
+        let mut results = Vec::with_capacity(bases.len());
+        let mut consecutive_failures = 0usize;
+        let mut aborted = false;
+        for base in bases {
+            match self.patch_transaction(base, patch).await {
+                Ok(pair) => {
+                    consecutive_failures = 0;
+                    results.push(Ok(pair));
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    results.push(Err(e));
+                    if consecutive_failures >= BULK_ABORT_AFTER {
+                        aborted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        BulkPatchOutcome { results, aborted }
     }
 
     // ------------------------------------------------ transaction creation (UNVERIFIED)

@@ -211,6 +211,147 @@ impl Transaction {
             Err(missing)
         }
     }
+
+    /// The raw `split` object when this transaction is split across categories,
+    /// else `None`. On the wire `split` is a nullable object living in `extra`
+    /// (openapi.yaml); its inner shape is not documented anywhere, so reads are
+    /// defensive (see [`Self::split_lines`]).
+    pub fn split_raw(&self) -> Option<&serde_json::Value> {
+        match self.extra.get("split") {
+            Some(v) if !v.is_null() => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Which key of a split object holds the line array: the first value that is
+    /// a non-empty array of objects. `None` when no recognizable line array.
+    fn split_container_key(split: &serde_json::Value) -> Option<String> {
+        let obj = split.as_object()?;
+        for (k, v) in obj {
+            if let Some(arr) = v.as_array() {
+                if arr.iter().any(|l| l.is_object()) {
+                    return Some(k.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Parsed split lines, defensively (the line array is found by shape, a
+    /// line's category ref under `coa` or `category`, its note under `memo` or
+    /// `notes` — the same tolerances as the reference TS client). `None` when
+    /// the transaction is not split; `Some(vec![])` when it is split but no
+    /// line array could be recognized.
+    pub fn split_lines(&self) -> Option<Vec<SplitLine>> {
+        let split = self.split_raw()?;
+        let key = Self::split_container_key(split)?;
+        let arr = split.get(&key)?.as_array()?;
+        Some(arr.iter().filter_map(SplitLine::parse).collect())
+    }
+
+    /// Replace this transaction's split with `lines`, preserving the container
+    /// shape (object keys) of an existing split object. A fresh split uses
+    /// `{ "splits": [...] }` — that container shape is inferred, which is why
+    /// the client gates fresh splits behind the unverified-writes flag.
+    pub fn apply_split(&mut self, lines: &[SplitLine]) {
+        let lines_json: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::to_value(l).unwrap_or_default())
+            .collect();
+        let mut obj = match self.split_raw().and_then(|v| v.as_object()).cloned() {
+            Some(o) => o,
+            None => serde_json::Map::new(),
+        };
+        let key = Self::split_container_key(&serde_json::Value::Object(obj.clone()))
+            .unwrap_or_else(|| "splits".to_string());
+        obj.insert(key, serde_json::Value::Array(lines_json));
+        self.extra
+            .insert("split".to_string(), serde_json::Value::Object(obj));
+    }
+
+    /// Remove the split (the web app unsplits a transaction when its category
+    /// is changed directly).
+    pub fn clear_split(&mut self) {
+        self.extra
+            .insert("split".to_string(), serde_json::Value::Null);
+    }
+}
+
+/// One line of a split transaction. Promoted fields are typed; anything else
+/// the server puts on a line rides in `extra` and round-trips.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitLine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coa: Option<CoaRef>,
+    /// Money: JSON number on the wire, `Decimal` in Rust.
+    #[serde(
+        default,
+        with = "crate::money::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub amount: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl SplitLine {
+    pub fn new(category_id: impl Into<String>, amount: Decimal, memo: Option<String>) -> Self {
+        SplitLine {
+            coa: Some(CoaRef::category(category_id)),
+            amount: Some(amount),
+            memo,
+            extra: Extra::new(),
+        }
+    }
+
+    /// Defensive parse of one raw split line (see [`Transaction::split_lines`]).
+    fn parse(raw: &serde_json::Value) -> Option<Self> {
+        let mut line: SplitLine = serde_json::from_value(raw.clone()).ok()?;
+        if line.coa.is_none() {
+            if let Some(cat) = raw.get("category") {
+                line.coa = serde_json::from_value(cat.clone()).ok();
+            }
+        }
+        if line.memo.is_none() {
+            line.memo = raw
+                .get("notes")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+        }
+        Some(line)
+    }
+}
+
+/// Validate a proposed split against its transaction: at least two lines,
+/// every line categorized with an amount, and the line amounts summing
+/// EXACTLY to the transaction amount (decimal arithmetic, no float slack).
+pub fn validate_split(txn: &Transaction, lines: &[SplitLine]) -> Result<(), String> {
+    if lines.len() < 2 {
+        return Err("a split needs at least 2 lines".to_string());
+    }
+    for (i, l) in lines.iter().enumerate() {
+        match &l.coa {
+            Some(c) if c.coa_type.as_deref() == Some("CATEGORY") && c.id.is_some() => {}
+            _ => return Err(format!("split line {} has no category", i + 1)),
+        }
+        if l.amount.is_none() {
+            return Err(format!("split line {} has no amount", i + 1));
+        }
+    }
+    let txn_amount = txn
+        .amount
+        .ok_or("transaction has no amount to split against")?;
+    let total: Decimal = lines.iter().filter_map(|l| l.amount).sum();
+    if total != txn_amount {
+        return Err(format!(
+            "split lines total {total} but the transaction amount is {txn_amount}; \
+             lines must total exactly the transaction amount"
+        ));
+    }
+    Ok(())
 }
 
 /// Typed, allowlisted patch for `update_transaction` — replaces upstream's free-form
@@ -260,6 +401,12 @@ impl TransactionPatch {
         }
         if let Some(v) = &self.coa {
             t.coa = Some(v.clone());
+            // The web app unsplits a transaction when its category is set
+            // directly; without this the PUT would carry a stale split object
+            // alongside the new category.
+            if t.split_raw().is_some() {
+                t.clear_split();
+            }
         }
         if let Some(v) = &self.tags {
             t.tags = Some(serde_json::Value::Array(
@@ -702,5 +849,112 @@ mod tests {
         assert_eq!(ch.mfa_channel, "EMAIL");
         assert_eq!(ch.email.as_deref(), Some("a***@example.com"));
         assert!(ch.phone.is_none());
+    }
+
+    fn split_txn_json(container_key: &str) -> serde_json::Value {
+        let mut split = serde_json::Map::new();
+        split.insert(
+            container_key.to_string(),
+            serde_json::json!([
+                { "coa": { "type": "CATEGORY", "id": "cat-groceries" }, "amount": -30.00, "memo": "food" },
+                { "coa": { "type": "CATEGORY", "id": "cat-health" }, "amount": -22.50, "notes": "otc" },
+            ]),
+        );
+        serde_json::json!({
+            "id": "txn-split",
+            "amount": -52.50,
+            "split": serde_json::Value::Object(split),
+        })
+    }
+
+    #[test]
+    fn split_lines_parse_defensively() {
+        // The container key is undocumented; parsing must find the line array
+        // under whatever key the server uses.
+        let t: Transaction = serde_json::from_value(split_txn_json("transactions")).unwrap();
+        let lines = t.split_lines().expect("split lines");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].coa.as_ref().unwrap().id.as_deref(), Some("cat-groceries"));
+        assert_eq!(
+            lines[0].amount.unwrap(),
+            Decimal::from_str("-30.00").unwrap()
+        );
+        assert_eq!(lines[0].memo.as_deref(), Some("food"));
+        // `notes` is accepted as the memo alias.
+        assert_eq!(lines[1].memo.as_deref(), Some("otc"));
+        // Not split -> None.
+        let plain: Transaction =
+            serde_json::from_value(serde_json::json!({ "id": "x", "amount": -1 })).unwrap();
+        assert!(plain.split_lines().is_none());
+        let null_split: Transaction = serde_json::from_value(
+            serde_json::json!({ "id": "x", "amount": -1, "split": null }),
+        )
+        .unwrap();
+        assert!(null_split.split_lines().is_none());
+    }
+
+    #[test]
+    fn validate_split_enforces_exact_total() {
+        let t: Transaction = serde_json::from_value(split_txn_json("splits")).unwrap();
+        let good = vec![
+            SplitLine::new("cat-groceries", Decimal::from_str("-30.00").unwrap(), None),
+            SplitLine::new("cat-health", Decimal::from_str("-22.50").unwrap(), None),
+        ];
+        assert!(validate_split(&t, &good).is_ok());
+        // Off by a cent -> reject (exact decimal comparison, no float slack).
+        let mut bad = good.clone();
+        bad[1].amount = Some(Decimal::from_str("-22.51").unwrap());
+        assert!(validate_split(&t, &bad).is_err());
+        // One line is not a split.
+        assert!(validate_split(&t, &good[..1]).is_err());
+        // Uncategorized line -> reject.
+        let mut nocat = good.clone();
+        nocat[0].coa = None;
+        assert!(validate_split(&t, &nocat).is_err());
+    }
+
+    #[test]
+    fn apply_split_preserves_container_shape() {
+        // Re-splitting keeps the observed container key.
+        let mut t: Transaction = serde_json::from_value(split_txn_json("transactions")).unwrap();
+        t.apply_split(&[SplitLine::new(
+            "cat-other",
+            Decimal::from_str("-52.50").unwrap(),
+            None,
+        )]);
+        let split = t.split_raw().unwrap();
+        assert!(split.get("transactions").is_some());
+        assert!(split.get("splits").is_none());
+        // And the new lines parse back.
+        let lines = t.split_lines().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].coa.as_ref().unwrap().id.as_deref(), Some("cat-other"));
+
+        // A fresh split uses the inferred container.
+        let mut plain: Transaction =
+            serde_json::from_value(serde_json::json!({ "id": "x", "amount": -10 })).unwrap();
+        plain.apply_split(&[SplitLine::new(
+            "cat-a",
+            Decimal::from_str("-10").unwrap(),
+            None,
+        )]);
+        assert!(plain.split_raw().unwrap().get("splits").is_some());
+    }
+
+    #[test]
+    fn category_patch_clears_existing_split() {
+        let t: Transaction = serde_json::from_value(split_txn_json("splits")).unwrap();
+        let patch = TransactionPatch {
+            coa: Some(CoaRef::category("cat-new")),
+            ..Default::default()
+        };
+        let out = patch.apply(&t);
+        assert!(out.split_raw().is_none());
+        // A patch that does not touch the category leaves the split alone.
+        let memo_only = TransactionPatch {
+            memo: Some("hi".to_string()),
+            ..Default::default()
+        };
+        assert!(memo_only.apply(&t).split_raw().is_some());
     }
 }
