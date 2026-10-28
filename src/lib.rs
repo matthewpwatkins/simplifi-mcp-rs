@@ -46,7 +46,7 @@ pub mod store;
 pub mod token_cache;
 pub mod transport;
 
-pub use auth::{AuthManager, LoginFlow};
+pub use auth::{parse_auth_session_export, AuthManager, LoginFlow};
 pub use client::{BulkCreateOutcome, BulkPatchOutcome, ListTransactionsParams, SimplifiClient};
 pub use config::Config;
 pub use error::{Error, Result};

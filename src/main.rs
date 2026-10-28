@@ -26,6 +26,14 @@ struct Cli {
 enum Command {
     /// Interactive credential login (prompts on stdin for an MFA code if challenged).
     Login,
+    /// Seed the token cache from a web-app session export (the value of
+    /// localStorage["authSession"] from a signed-in browser), for users who
+    /// cannot hand their password to the CLI. Delete the export file after.
+    ImportSession {
+        /// Path to the authSession export (JSON).
+        #[arg(long)]
+        from_auth_session: std::path::PathBuf,
+    },
     /// Clear cached Simplifi tokens.
     Logout,
     /// Show redacted token-cache status (never prints secrets).
@@ -141,6 +149,18 @@ async fn run() -> simplifi_mcp::Result<()> {
                     println!("MFA login complete; tokens cached (encrypted)");
                 }
             }
+        }
+        Command::ImportSession { from_auth_session } => {
+            let text = std::fs::read_to_string(&from_auth_session)?;
+            let tokens = simplifi_mcp::parse_auth_session_export(&text)?;
+            client.auth().cache().store_tokens(&tokens)?;
+            // Redacted confirmation only — never the token values.
+            print_json(&client.auth().cache().status())?;
+            eprintln!(
+                "session imported; tokens cached (encrypted). \
+                 Delete the export file now: {}",
+                from_auth_session.display()
+            );
         }
         Command::Logout => {
             client.auth().logout()?;

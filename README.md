@@ -176,6 +176,7 @@ outputs are `{total, nextCursor?, items}`.
 
 ```sh
 simplifi-mcp login          # interactive credential login (prompts for MFA code)
+simplifi-mcp import-session --from-auth-session f.json  # seed token cache from a browser session export
 simplifi-mcp logout         # clear cached tokens
 simplifi-mcp status         # redacted cache status (never prints secrets)
 simplifi-mcp whoami         # GET /userprofiles/me sanity probe
@@ -194,7 +195,7 @@ entire stack (auth flow, MFA challenge, pagination, tools) runs with **zero live
 credentials and zero network**:
 
 ```sh
-cargo test --features mock            # full suite: 83 tests, no network
+cargo test --features mock            # full suite: 85 tests, no network
 cargo test --features "mock http"     # + HTTP transport tests
 cargo clippy --all-targets --features "mock http" -- -D warnings
 cargo audit
